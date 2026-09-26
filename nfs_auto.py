@@ -1034,13 +1034,15 @@ class NFSAutoBot(QtCore.QObject):
             time.sleep(max(0, DETECT_INTERVAL - total_ms / 1000))
 
     def process_state(self, state, click_pos):
-        """根据当前状态执行对应动作"""
+        """根据当前状态执行对应动作
+        逻辑：进入新状态时点击一次；如果点击后3秒状态没变，重新点击（防卡）
+        """
         now = time.time()
 
         if state == STATE_IN_GAME:
-            # 游戏中：定时按键（通过AHK中转F1->I）
+            # 游戏中：定时按键
             if now - self.last_key_time >= IN_GAME_KEY_INTERVAL:
-                self.log.info(f"[游戏中] 按{IN_GAME_KEY.upper()}键 (AHK转I键)")
+                self.log.info(f"[游戏中] 按{IN_GAME_KEY.upper()}键")
                 self.controller.press_key(IN_GAME_KEY, IN_GAME_KEY_DURATION)
                 self.last_key_time = now
 
@@ -1052,17 +1054,35 @@ class NFSAutoBot(QtCore.QObject):
         else:
             # 其他状态：点击对应按钮
             if state != self.current_state:
+                # 第一次进入该状态，点击
                 action = STATE_CLICK_ACTION.get(state, "点击")
                 self.log.info(f"[{state}] {action}")
                 time.sleep(0.2)
                 if click_pos and click_pos[0] > 0 and click_pos[1] > 0:
                     self.controller.click(click_pos[0], click_pos[1])
+                    self._last_click_time = now
+                    self._last_click_state = state
+                    self._retry_count = 0
 
                     # 结算界面 -> 完成一轮
                     if state in (STATE_RESULT_1, STATE_RESULT_2) and self.current_state == STATE_IN_GAME:
                         self.round_count += 1
                         self.update_round_signal.emit(self.round_count)
                         self.log.info(f"=== 第 {self.round_count} 轮完成 ===")
+            else:
+                # 状态没变，检查是否需要重新点击（防卡死）
+                RETRY_DELAY = 3.0  # 3秒后重试
+                MAX_RETRY = 5      # 最多重试5次
+                if (hasattr(self, '_last_click_time')
+                        and self._last_click_state == state
+                        and now - self._last_click_time >= RETRY_DELAY
+                        and getattr(self, '_retry_count', 0) < MAX_RETRY):
+                    self._retry_count += 1
+                    self.log.warning(
+                        f"[{state}] 状态未变化 {RETRY_DELAY:.0f}秒，重新点击 (第{self._retry_count}次重试)")
+                    if click_pos and click_pos[0] > 0 and click_pos[1] > 0:
+                        self.controller.click(click_pos[0], click_pos[1])
+                        self._last_click_time = now
 
         self.current_state = state
 
