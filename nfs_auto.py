@@ -127,6 +127,7 @@ class TemplateMatcher:
         self.templates = {}  # state_name -> template_info
         self._last_state = STATE_UNKNOWN
         self._last_scale = 1.0
+        self._base_scale = 1.0  # 全量匹配的尺度中心，随实际 UI 缩放自适应
         self._pyramid_scale = 4  # 粗匹配缩小倍数
         self._coarse_threshold = 0.45  # 粗匹配阈值，超过才做精匹配
         self.load_templates(template_dir)
@@ -276,6 +277,20 @@ class TemplateMatcher:
 
         return best_fine_conf, best_fine_click, best_fine_scale
 
+    def _scale_ladder(self, quick=False):
+        """
+        生成多尺度搜索梯子。
+        游戏窗口化 2560x1440 时截取的模板，按 F11 全屏后 UI 放大 1.5 倍，
+        因此尺度必须向上覆盖放大档，不能只往下缩。
+        """
+        # 中心缩放因子±15% 步进，覆盖约 0.44x ~ 1.67x
+        factors = [1.0, 0.85, 1.18, 0.72, 1.38, 0.62, 1.6, 0.52]
+        ladder = [self._base_scale * f for f in factors]
+        if quick:
+            # 快速路径只取靠近上次命中尺度的 3 档
+            ladder = sorted(ladder, key=lambda s: abs(s - self._last_scale))[:3]
+        return ladder
+
     def match_all(self, screen_img):
         """
         两阶段匹配所有模板（支持一个状态多个模板）
@@ -289,8 +304,6 @@ class TemplateMatcher:
         small_w = sw // self._pyramid_scale
         small_h = sh // self._pyramid_scale
         screen_gray_small = cv2.resize(screen_gray, (small_w, small_h))
-
-        scales = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5]
 
         best_state = STATE_UNKNOWN
         best_confidence = 0
@@ -307,8 +320,7 @@ class TemplateMatcher:
                     fit_scale = min(sh / th, sw / tw) * 0.95
                     quick_scales = [fit_scale]
                 else:
-                    s = self._last_scale
-                    quick_scales = [s * 1.08, s, s * 0.92]
+                    quick_scales = self._scale_ladder(quick=True)
 
                 roi_full = get_roi_from_hint(screen_img.shape, tinfo["pos_hint"])
                 roi_small = (roi_full[0] // self._pyramid_scale,
@@ -347,7 +359,7 @@ class TemplateMatcher:
                         continue
                     test_scales = [fit_scale]
                 else:
-                    test_scales = scales
+                    test_scales = self._scale_ladder()
 
                 conf, click, scale = self._match_two_stage(
                     tinfo["image"], tinfo["gray"], screen_img, screen_gray_small,
@@ -370,12 +382,28 @@ class TemplateMatcher:
 
         if best_confidence >= MATCH_THRESHOLD:
             self._last_state = best_state
+            # 以实际命中尺度为新基准，分辨率再变化（如 F11 全屏切换）时
+            # 快速路径能从正确的尺度附近继续搜索
+            if best_confidence > 0.9:
+                self._base_scale = max(0.4, min(2.0, self._last_scale))
             self.log.debug(f"匹配[全量]: {best_state}, conf={best_confidence:.3f}, {elapsed:.0f}ms")
             return best_state, best_confidence, best_click_pos
         else:
+            # 全量匹配失败：尺度基准可能已失效（如 F11 切换分辨率），
+            # 重置为 1.0 重新扫全梯子；同时更新基准为当前屏幕与模板的粗略比例
             self._last_state = STATE_UNKNOWN
+            self._retune_base_scale(sw, sh)
             self.log.debug(f"匹配[未知], 最高={best_confidence:.3f}, {elapsed:.0f}ms")
             return STATE_UNKNOWN, best_confidence, (0, 0)
+
+    def _retune_base_scale(self, screen_w, screen_h):
+        """匹配失败时按屏幕分辨率估算 UI 缩放基准。
+        模板取自 2560x1440 窗口，若当前屏幕更大，基准相应放大。"""
+        # 模板均取自窗口化 2560x1440；屏幕分辨率与该基准的比值作为中心尺度
+        template_ref_w = 2560.0
+        ratio = screen_w / template_ref_w
+        # 基准只做温和修正，避免被异常截图带偏
+        self._base_scale = max(0.4, min(2.0, ratio))
 
 
 class WindowCapture:
@@ -489,6 +517,16 @@ class WindowCapture:
         elapsed = (time.time() - t0) * 1000
         self.log.debug(f"截图: {img.shape[1]}x{img.shape[0]}, 耗时={elapsed:.0f}ms")
         return img
+
+    def get_client_size(self):
+        """获取游戏窗口客户区尺寸 (宽, 高)；窗口无效时返回 (0, 0)"""
+        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
+            return (0, 0)
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            return (right - left, bottom - top)
+        except Exception:
+            return (0, 0)
 
 
 class InputController:
@@ -948,6 +986,7 @@ class NFSAutoBot(QtCore.QObject):
         self.last_key_time = 0
         self.last_state = STATE_UNKNOWN
         self.state_stable_time = 0
+        self._last_client_size = self.capturer.get_client_size()
 
         # 连接UI信号
         self.update_state_signal.connect(self.floating_window.update_state)
@@ -990,6 +1029,22 @@ class NFSAutoBot(QtCore.QObject):
             t_total = time.time()
 
             try:
+                # 0. 检测游戏窗口尺寸变化（F11 全屏切换会导致分辨率改变，
+                #    模板尺度随之变化，需要立即重置匹配状态）
+                client_size = self.capturer.get_client_size()
+                if client_size != self._last_client_size:
+                    if client_size != (0, 0) and self._last_client_size != (0, 0):
+                        ratio = client_size[0] / max(1, self._last_client_size[0])
+                        self.log.info(
+                            f"检测到游戏窗口尺寸变化: {self._last_client_size[0]}x{self._last_client_size[1]}"
+                            f" -> {client_size[0]}x{client_size[1]} (比例{ratio:.2f})，重置模板匹配状态")
+                        # 按尺寸比例修正基准尺度，让下一次全量匹配直接命中
+                        self.matcher._base_scale = max(0.4, min(2.0,
+                            self.matcher._base_scale * ratio))
+                        self.matcher._last_state = STATE_UNKNOWN
+                        self.matcher._last_scale = self.matcher._base_scale
+                    self._last_client_size = client_size
+
                 # 1. 截图
                 t0 = time.time()
                 screen = self.capturer.capture()
